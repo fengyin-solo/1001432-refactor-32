@@ -18,16 +18,23 @@ STATUSES = ["待审批", "已批复", "执行中", "已超支"]
 
 @router.get("", response_model=PageResult[dict])
 def list_entries(
-    keyword: str | None = Query(default=None, description="按资金编号检索"),
+    keyword: str | None = Query(default=None, description="按资金编号或项目名称检索"),
     status: str | None = Query(default=None, description="待审批、已批复、执行中、已超支"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按资金编号与状态过滤养护资金列表；没有数据时返回空页，不报错。"""
+    """按资金编号与状态过滤养护资金列表；合计与明细共用同一份资金算法。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
-    return PageResult(items=items, total=total, page=page, size=size)
+    items, total, stats = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    return PageResult(items=items, total=total, page=page, size=size, stats=stats)
+
+
+@router.get("/export")
+def export_entries(keyword: str | None = None, status: str | None = None) -> dict[str, Any]:
+    """导出养护资金清单：全量数据与合计口径，和列表完全一致。"""
+    items, total, stats = service.list_entries(keyword=keyword, status=status, page=1, size=10000)
+    return {"module": "fund", "total": total, "stats": stats, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -41,25 +48,19 @@ def get_entry(entry_id: int) -> dict:
 
 @router.post("", response_model=ActionResult)
 def create_entry(payload: EntryPayload) -> ActionResult:
-    """登记一条资金记录，缺字段时说明原因而不是静默丢弃。"""
-    entry, missing = service.create_entry(payload.values)
+    """登记一条资金记录，缺字段时说明原因而不是静默丢弃；同项目重复登记只留一条。"""
+    entry, missing, merge_message = service.create_entry(payload.values)
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
-    return ActionResult(ok=True, message="资金记录已登记", entry=entry)
+    return ActionResult(ok=True, message=merge_message or "资金记录已登记", entry=entry)
 
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     """对单条资金记录执行提交审批、确认批复、标记超支；不允许的动作会被拦下并说明原因。"""
     action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
+    approver = str(payload.values.get("审批人员") or "").strip()
+    entry, message = service.run_action(entry_id, action, approver=approver)
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出养护资金清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "fund", "total": total, "items": items}
